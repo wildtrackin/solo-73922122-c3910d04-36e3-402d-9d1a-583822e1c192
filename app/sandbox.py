@@ -1,264 +1,305 @@
-"""Subprocess supervisor around the one-shot WASI runner.
+"""API-side client for the out-of-process runner supervisor.
 
-Every request gets a new temporary directory, a fresh runner interpreter and a
-new process group.  The runner is confined by WASI itself (no preopens, empty
-environment, no sockets, only fds 0/1/2), while this module confines the host
-process with timeout, output-size limits, fd hygiene and process-group reaping.
+The API worker never spawns plugin runners itself.  It sends each validated
+request to the supervisor (``app/supervisor.py``) over a filesystem-scoped
+Unix domain socket and polls for the result.  This module preserves the old
+in-process ``execute_plugin`` contract used by ``app/main.py`` -- including the
+exact error codes -- while the process lifecycle lives outside the API.
+
+Concurrency model: every in-flight request owns its own short-lived socket
+connection (a small pool guarded by a semaphore), so requests never share a
+buffer or a lock and cannot block one another.  The supervisor accepts many
+simultaneous connections and keys every run by a random id.
+
+Operational consequences:
+
+* if the API is stopped with SIGSTOP, polling pauses but the supervisor keeps
+  enforcing the 2 second runner wall clock; when the API resumes, the finished
+  run is reported as a timeout and no partial output is returned;
+* if the API is SIGKILLed, the supervisor -- which owns every runner -- kills
+  and reaps them and removes their staging directories on its own;
+* a fresh API process starts with an empty client, so it can never address a
+  previous instance's run ids or files.
 """
 
+from __future__ import annotations
+
 import asyncio
+import base64
+import json
 import os
-import shutil
-import signal
-import sys
-import tempfile
-from pathlib import Path
+import socket
 
-from .config import MAX_PLUGIN_OUTPUT_BYTES, PLUGIN_TIMEOUT_SECONDS
+from .config import CONTROL_SOCKET_PATH, PLUGIN_TIMEOUT_SECONDS
 from .errors import ApiError
+from .runresult import KILLED_BY_SUPERVISOR, failure_for_returncode
 
-RUNNER_PATH = Path(__file__).resolve().with_name("runner.py")
-READ_CHUNK = 4096
-POLL_INTERVAL = 0.01
-REAP_GRACE_SECONDS = 1.0
+POLL_INTERVAL_SECONDS = 0.025
+# The supervisor guarantees a decision within the plugin timeout; the margin
+# only covers scheduling and a final authoritative re-read.  If no answer
+# arrives, the control plane is treated as unavailable rather than hanging.
+POLL_DEADLINE_MARGIN_SECONDS = 10.0
+# Bound the number of concurrently open control connections; each is cheap and
+# the supervisor's listen backlog plus pids_limit cap the other side anyway.
+MAX_CONTROL_CONNECTIONS = 64
+CONNECT_TIMEOUT_SECONDS = 5.0
+IO_TIMEOUT_SECONDS = 10.0
 
-_EXIT_CODES = {
-    20: (422, "invalid_module", "The uploaded file is not a valid WebAssembly module."),
-    21: (422, "plugin_instantiation_failed", "The module could not be instantiated or its imports could not be linked."),
-    22: (422, "plugin_trap", "The plugin trapped while executing."),
-    23: (422, "plugin_nonzero_exit", "The plugin exited with a non-zero status."),
-    24: (422, "invalid_module", "The module does not export a WASI _start function."),
-    25: (422, "invalid_module", "The module's _start export has an invalid signature."),
-    26: (500, "sandbox_internal_error", "The sandbox runner failed."),
-}
+# Terminal states produced by the supervisor (mirrors app/supervisor.py).
+STATE_EXITED = "exited"
+STATE_TIMEOUT = "timeout"
+STATE_OUTPUT_TOO_LARGE = "output_too_large"
+STATE_CANCELLED = "cancelled"
+STATE_API_DEAD = "api_dead"
+STATE_SHUTDOWN = "shutdown"
+STATE_SPAWN_FAILED = "spawn_failed"
 
 
-def _kill_group(proc: asyncio.subprocess.Process) -> None:
-    """Kill the runner and anything it may have created in its session."""
-    if proc.returncode is not None:
-        return
+class SupervisorUnavailable(ApiError):
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            503,
+            "sandbox_unavailable",
+            f"The sandbox supervisor is unavailable: {detail}.",
+        )
 
-    # start_new_session=True makes the child the leader of its own process
-    # group, so this cannot signal the API process.
-    killed = False
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-        killed = True
-    except OSError:
-        pass
 
-    if not killed:
-        # Fallback for platforms without process groups.  The child may have
-        # exited between the check above and the signal, which is harmless.
+class ControlConnection:
+    """One blocking, single-request-pipeline Unix socket connection."""
+
+    def __init__(self, socket_path: str) -> None:
+        self.socket_path = socket_path
+        self._sock: socket.socket | None = None
+        self._buffer = bytearray()
+
+    def __enter__(self) -> "ControlConnection":
+        self.connect()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(CONNECT_TIMEOUT_SECONDS)
         try:
-            proc.kill()
-        except OSError:
-            pass
+            sock.connect(self.socket_path)
+        except OSError as exc:
+            sock.close()
+            raise SupervisorUnavailable(
+                f"cannot connect to {self.socket_path} ({exc.__class__.__name__})"
+            ) from exc
+        sock.settimeout(IO_TIMEOUT_SECONDS)
+        self._sock = sock
+        self._buffer = bytearray()
 
-
-async def _reap(proc: asyncio.subprocess.Process, wait_task: asyncio.Task) -> None:
-    _kill_group(proc)
-    if not wait_task.done():
-        try:
-            await asyncio.wait_for(asyncio.shield(wait_task), REAP_GRACE_SECONDS)
-        except asyncio.TimeoutError:
-            # A SIGKILLed child should leave immediately.  If it does not,
-            # there is nothing more this supervisor can safely do.
-            pass
-    if wait_task.done():
-        try:
-            wait_task.result()
-        except Exception:
-            pass
-
-
-async def _supervise(
-    proc: asyncio.subprocess.Process,
-    request,
-) -> tuple[bytes, bytes, int, str | None]:
-    """Drain output and wait for the child under the sandbox limits."""
-    stdout = bytearray()
-    stderr = bytearray()
-    total = 0
-    overflow = False
-
-    async def read_stream(stream: asyncio.StreamReader, sink: bytearray) -> None:
-        nonlocal total, overflow
-        try:
-            while True:
-                chunk = await stream.read(READ_CHUNK)
-                if not chunk:
-                    return
-                if overflow:
-                    # Another reader has already found the limit and killed the
-                    # child.  Keep draining until EOF so the pipe closes.
-                    continue
-                total += len(chunk)
-                if total > MAX_PLUGIN_OUTPUT_BYTES:
-                    overflow = True
-                    _kill_group(proc)
-                    return
-                sink.extend(chunk)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # Broken pipe while the child is being killed is expected.
-            return
-
-    stdout_task = asyncio.create_task(read_stream(proc.stdout, stdout))
-    stderr_task = asyncio.create_task(read_stream(proc.stderr, stderr))
-    wait_task = asyncio.create_task(proc.wait())
-    reader_tasks = (stdout_task, stderr_task)
-
-    deadline = asyncio.get_running_loop().time() + PLUGIN_TIMEOUT_SECONDS
-    failure: str | None = None
-
-    try:
-        while True:
+    def close(self) -> None:
+        if self._sock is not None:
             try:
-                if await request.is_disconnected():
-                    failure = "client_disconnected"
-                    break
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # A request implementation that cannot answer does not get to
-                # disable the timeout or output limit.
+                self._sock.close()
+            except OSError:
                 pass
+        self._sock = None
+        self._buffer = bytearray()
 
-            if overflow:
-                failure = "output_too_large"
-                break
-            if wait_task.done():
-                break
-
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                failure = "timeout"
-                break
-            await asyncio.sleep(min(POLL_INTERVAL, remaining))
-
-        if failure is not None:
-            _kill_group(proc)
-
-        if not wait_task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(wait_task), REAP_GRACE_SECONDS)
-            except asyncio.TimeoutError:
-                _kill_group(proc)
-                try:
-                    await asyncio.wait_for(asyncio.shield(wait_task), REAP_GRACE_SECONDS)
-                except asyncio.TimeoutError:
-                    pass
-
-        # EOF follows the child's death.  Do not wait forever on a pipe held by
-        # an unexpected descendant.
+    def request(self, payload: dict) -> dict:
+        if self._sock is None:
+            self.connect()
+        frame = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
         try:
-            await asyncio.wait_for(
-                asyncio.gather(stdout_task, stderr_task), REAP_GRACE_SECONDS
+            self._sock.sendall(frame)
+        except OSError as exc:
+            self.close()
+            raise SupervisorUnavailable(
+                f"control write failed ({exc.__class__.__name__})"
+            ) from exc
+
+        while b"\n" not in self._buffer:
+            try:
+                chunk = self._sock.recv(65536)
+            except socket.timeout as exc:
+                self.close()
+                raise SupervisorUnavailable("control read timed out") from exc
+            except OSError as exc:
+                self.close()
+                raise SupervisorUnavailable(
+                    f"control read failed ({exc.__class__.__name__})"
+                ) from exc
+            if not chunk:
+                self.close()
+                raise SupervisorUnavailable("control connection closed")
+            self._buffer.extend(chunk)
+
+        line, _, rest = self._buffer.partition(b"\n")
+        del self._buffer[: len(line) + 1]
+        try:
+            reply = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            self.close()
+            raise SupervisorUnavailable("malformed control frame") from exc
+        if not isinstance(reply, dict):
+            self.close()
+            raise SupervisorUnavailable("malformed control frame")
+        if reply.get("type") == "error":
+            self.close()
+            raise SupervisorUnavailable(
+                f"supervisor rejected frame: {reply.get('error')}"
             )
-        except asyncio.TimeoutError:
-            for task in reader_tasks:
-                task.cancel()
-            await asyncio.gather(*reader_tasks, return_exceptions=True)
-
-        if failure is None and (overflow or total > MAX_PLUGIN_OUTPUT_BYTES):
-            failure = "output_too_large"
-
-        return bytes(stdout), bytes(stderr), proc.returncode, failure
-    finally:
-        if failure is not None and proc.returncode is None:
-            _kill_group(proc)
-        if not wait_task.done():
-            # This path is used when the coroutine is cancelled by the server.
-            await _reap(proc, wait_task)
-        for task in reader_tasks:
-            if not task.done():
-                task.cancel()
-        if reader_tasks:
-            await asyncio.gather(*reader_tasks, return_exceptions=True)
+        return reply
 
 
-def _process_runner_failure(returncode: int) -> None:
-    mapping = _EXIT_CODES.get(returncode)
-    if mapping is None:
-        raise ApiError(
-            502,
-            "sandbox_process_failed",
-            "The sandbox runner ended unexpectedly.",
+class SupervisorClient:
+    """Factory for per-request control connections, concurrency-safe."""
+
+    def __init__(self, socket_path: str = CONTROL_SOCKET_PATH) -> None:
+        self.socket_path = socket_path
+        self._slots = asyncio.Semaphore(MAX_CONTROL_CONNECTIONS)
+
+    def _submit(self, conn: ControlConnection, module_bytes: bytes,
+                log_bytes: bytes) -> str:
+        reply = conn.request(
+            {
+                "type": "submit",
+                "module_b64": base64.b64encode(module_bytes).decode("ascii"),
+                "log_b64": base64.b64encode(log_bytes).decode("ascii"),
+            }
         )
-    status_code, code, message = mapping
-    raise ApiError(status_code, code, message)
+        if reply.get("type") != "submitted" or "id" not in reply:
+            raise SupervisorUnavailable("unexpected submit acknowledgement")
+        return str(reply["id"])
 
+    @staticmethod
+    def _cancel(conn: ControlConnection, run_id: str) -> None:
+        try:
+            conn.request({"type": "cancel", "id": run_id})
+        except SupervisorUnavailable:
+            # The supervisor's own timeout/death sweep is the backstop; a lost
+            # cancel must not mask the client-disconnect error.
+            pass
 
-async def execute_plugin(module_bytes: bytes, log_bytes: bytes, request) -> bytes:
-    """Run one plugin in an isolated child and return its complete stdout."""
-    temp_dir = tempfile.mkdtemp(prefix="wasm-endpoint-")
-    module_path = os.path.join(temp_dir, "plugin.wasm")
-    log_path = os.path.join(temp_dir, "input.json")
-    proc: asyncio.subprocess.Process | None = None
+    async def execute(
+        self, module_bytes: bytes, log_bytes: bytes, request
+    ) -> bytes:
+        # The semaphore only bounds open fds; it does not serialise requests.
+        async with self._slots:
+            conn = ControlConnection(self.socket_path)
+            try:
+                run_id = await asyncio.to_thread(
+                    self._submit, conn, module_bytes, log_bytes
+                )
+                hard_deadline = (
+                    asyncio.get_running_loop().time()
+                    + PLUGIN_TIMEOUT_SECONDS
+                    + POLL_DEADLINE_MARGIN_SECONDS
+                )
+                while True:
+                    frame = await asyncio.to_thread(
+                        conn.request, {"type": "poll", "id": run_id}
+                    )
+                    if frame.get("state") != "unknown" and frame.get("done"):
+                        return self._interpret(frame)
 
-    try:
-        with open(module_path, "wb") as module_file:
-            module_file.write(module_bytes)
-        with open(log_path, "wb") as log_file:
-            log_file.write(log_bytes)
-        os.chmod(module_path, 0o600)
-        os.chmod(log_path, 0o600)
+                    try:
+                        if await request.is_disconnected():
+                            await asyncio.to_thread(self._cancel, conn, run_id)
+                            raise ApiError(
+                                499,
+                                "client_disconnected",
+                                "The client disconnected before the plugin "
+                                "completed.",
+                            )
+                    except ApiError:
+                        raise
+                    except Exception:
+                        # A probe failure must not disable the timeout backstop.
+                        pass
 
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-B",
-            "-I",
-            str(RUNNER_PATH),
-            module_path,
-            log_path,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd="/",
-            env={},
-            close_fds=True,
-            start_new_session=True,
-        )
+                    if asyncio.get_running_loop().time() > hard_deadline:
+                        # One authoritative reading first: after SIGSTOP/SIGCONT
+                        # the supervisor has usually finalised the run, and that
+                        # result (e.g. a 504 timeout) must win over the backstop.
+                        final = await asyncio.to_thread(
+                            conn.request, {"type": "poll", "id": run_id}
+                        )
+                        if final.get("state") != "unknown" and final.get("done"):
+                            return self._interpret(final)
+                        await asyncio.to_thread(self._cancel, conn, run_id)
+                        raise SupervisorUnavailable(
+                            "no result within the wait budget"
+                        )
 
-        stdout, _stderr, returncode, failure = await _supervise(proc, request)
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            finally:
+                conn.close()
 
-        if failure == "client_disconnected":
-            raise ApiError(
-                499,
-                "client_disconnected",
-                "The client disconnected before the plugin completed.",
-            )
-        if failure == "timeout":
+    def _interpret(self, frame: dict) -> bytes:
+        state = frame.get("state")
+        if state == STATE_EXITED and frame.get("returncode") == 0:
+            try:
+                return base64.b64decode(frame.get("stdout_b64", ""), validate=True)
+            except (ValueError, TypeError) as exc:
+                raise ApiError(
+                    500,
+                    "sandbox_internal_error",
+                    "The sandbox returned an undecodable result.",
+                ) from exc
+
+        if state == STATE_TIMEOUT:
             raise ApiError(
                 504,
                 "plugin_timeout",
                 f"Plugin execution exceeded the {PLUGIN_TIMEOUT_SECONDS:g} second limit.",
             )
-        if failure == "output_too_large":
+        if state == STATE_OUTPUT_TOO_LARGE:
             raise ApiError(
                 413,
                 "plugin_output_too_large",
-                f"Plugin stdout and stderr exceeded {MAX_PLUGIN_OUTPUT_BYTES} bytes.",
+                "Plugin stdout and stderr exceeded the combined output limit.",
+            )
+        if state == STATE_CANCELLED:
+            # Only the client-disconnect path requests cancellation; that path
+            # raises 499 itself, so reaching here means a supervisor decision.
+            raise ApiError(
+                503,
+                "sandbox_interrupted",
+                "The plugin run was terminated before it completed.",
+            )
+        if state in (STATE_API_DEAD, STATE_SHUTDOWN):
+            raise ApiError(
+                503,
+                "sandbox_interrupted",
+                "The sandbox supervisor terminated the run while the API "
+                "worker was unavailable; no partial output is returned.",
+            )
+        if state == STATE_SPAWN_FAILED:
+            raise ApiError(
+                500,
+                "sandbox_internal_error",
+                "The sandbox could not start the plugin runner.",
             )
 
-        if returncode != 0:
-            _process_runner_failure(returncode)
-
-        return stdout
-
-    except ApiError:
-        raise
-    except Exception:
+        returncode = frame.get("returncode")
+        if isinstance(returncode, int) and returncode != KILLED_BY_SUPERVISOR:
+            raise failure_for_returncode(returncode)
         raise ApiError(
-            500,
-            "sandbox_internal_error",
-            "The sandbox could not complete the request.",
+            502,
+            "sandbox_process_failed",
+            "The sandbox runner ended unexpectedly.",
         )
-    finally:
-        if proc is not None and proc.returncode is None:
-            _kill_group(proc)
-        # Temporary input files are removed synchronously so cancellation and
-        # disconnect paths cannot skip cleanup.
-        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    # Compatibility helper used by the test fixtures.
+    def _close(self) -> None:
+        # Per-request connections are short-lived; nothing pooled to reset.
+        return None
+
+
+# A single client per API process.  A restarted worker therefore starts with
+# no knowledge of any previous worker's runs.
+_client = SupervisorClient()
+
+
+async def execute_plugin(module_bytes: bytes, log_bytes: bytes, request) -> bytes:
+    """Run one plugin via the supervisor and return its complete stdout."""
+    if not os.path.exists(CONTROL_SOCKET_PATH):
+        raise SupervisorUnavailable("control socket is missing")
+    return await _client.execute(module_bytes, log_bytes, request)

@@ -1,6 +1,10 @@
 """API and sandbox regression tests.
 
 Run with:  pytest -q
+
+The API no longer spawns runners itself: conftest.py starts a real
+out-of-process supervisor (with the real app/runner.py and wasmtime) and the
+API talks to it over a Unix socket, exactly as in the container.
 """
 
 import asyncio
@@ -12,6 +16,7 @@ import pytest
 import wasmtime
 
 from app.main import app
+from app.sandbox import SupervisorUnavailable
 
 HERE = Path(__file__).resolve().parent
 DEMO = HERE.parent / "demo"
@@ -228,6 +233,31 @@ def test_timeout() -> None:
     response = _post(_module("loop"), b"{}", timeout=60.0)
     assert response.status_code == 504
     assert response.json()["error"]["code"] == "plugin_timeout"
+
+
+def test_timeout_returns_no_partial_output() -> None:
+    # The loop module never writes; even if it had, a timeout must surface as
+    # a 504 error envelope rather than any captured stdout.
+    response = _post(_module("loop"), b"{}", timeout=60.0)
+    assert response.status_code == 504
+    assert "verdict" not in response.text
+    assert set(response.json().keys()) == {"error"}
+
+
+def test_supervisor_unavailable_is_surfaced_as_503(monkeypatch, tmp_path):
+    """A missing control plane never hangs the request."""
+    from app import sandbox as sandbox_mod
+
+    missing = str(tmp_path / "absent.sock")
+    monkeypatch.setattr(sandbox_mod, "CONTROL_SOCKET_PATH", missing)
+    # The module-level client captures the path at import time; point this
+    # process's client at the same missing socket.
+    monkeypatch.setattr(sandbox_mod._client, "socket_path", missing)
+    sandbox_mod._client._close()
+    response = _post(_module("classify"), _json("sample-log.json"))
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "sandbox_unavailable"
+    assert isinstance(SupervisorUnavailable, type)
 
 
 def test_stuck_plugin_does_not_block_another_request() -> None:

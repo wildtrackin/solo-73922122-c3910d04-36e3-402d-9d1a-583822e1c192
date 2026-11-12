@@ -6,10 +6,14 @@ services:
     image: wasm-plugin-sandbox:local
     ports:
       - "8000:8000"
+    # The in-container supervisor restarts the API worker itself; the policy
+    # only covers an unexpected exit of the whole container.
     restart: unless-stopped
     read_only: true
     tmpfs:
-      - /tmp:size=64m,mode=1777,noexec,nosuid,nodev
+      # Holds the control socket and every per-run staging directory.  Nothing
+      # plugin-related is ever written to the image layer or a volume.
+      - /tmp:size=128m,mode=1777,noexec,nosuid,nodev
     cap_drop:
       - ALL
     security_opt:
@@ -18,6 +22,10 @@ services:
     mem_limit: 512m
     environment:
       TMPDIR: /tmp
+      WASM_SANDBOX_RUNTIME_ROOT: /tmp/wasm-sandbox
+    # Fault demos only stop or kill the *API worker* inside the container;
+    # the container itself and the supervisor keep running.  Do not use
+    # `docker restart` for those scenarios.
     healthcheck:
       test:
         - CMD
@@ -27,4 +35,4 @@ services:
       interval: 15s
       timeout: 3s
       retries: 3
-      start_period: 5s
+      start_period: 10s

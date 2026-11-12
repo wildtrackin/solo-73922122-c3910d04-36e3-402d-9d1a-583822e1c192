@@ -25,13 +25,16 @@ sanitised JSON log and returns the JSON that the module writes to stdout.
 Sandbox guarantees:
 
 * module upload: at most **1 MiB**; log upload: at most **64 KiB** of UTF-8 JSON
-* one fresh subprocess per request, with an empty WASI environment, no preopened
-  host directories, no sockets, and only stdin/stdout/stderr
+* one fresh runner subprocess per request, owned by an independent supervisor
+  process, with an empty WASI environment, no preopened host directories, no
+  sockets, and only stdin/stdout/stderr
 * linear memory capped at **64 MiB**; wall-clock execution capped at
-  **{PLUGIN_TIMEOUT_SECONDS:g} seconds**
+  **{PLUGIN_TIMEOUT_SECONDS:g} seconds**, measured by the supervisor -- the
+  limit still applies while this API process is stopped
 * combined plugin stdout + stderr capped at **{MAX_PLUGIN_OUTPUT_BYTES} bytes**
-* timeout, output overflow, or client disconnect kills and reaps the process
-  group and removes temporary files; partial output is never returned
+* timeout, output overflow, API crash or client disconnect kills and reaps the
+  runner's process group and removes its staging directory; partial output is
+  never returned
 
 Demo artifacts are in the repository's `demo/` directory:
 
@@ -145,6 +148,7 @@ def _validate_log(data: bytes) -> None:
         413: {"description": "An upload or the plugin's output exceeded a size limit."},
         422: {"description": "Invalid module, invalid log JSON, plugin trap, or non-zero exit."},
         499: {"description": "The client disconnected; the plugin was terminated."},
+        503: {"description": "The supervisor is unavailable or terminated the run."},
         504: {"description": "The plugin exceeded the execution time limit."},
     },
     description="""
